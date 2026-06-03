@@ -43,6 +43,126 @@ For a recruiter or hiring manager, this reads as: *understands fin-tech primitiv
 
 ---
 
+## Microservice Architecture
+
+The project has been split from a single FastAPI app into a small, explicit
+**microservice topology**. The matching logic is unchanged — it is reused as a
+shared library — and two thin HTTP services are layered on top.
+
+### The core package remains
+
+`src/mini_exchange` is **untouched** and still owns all domain logic:
+
+- the **matching engine** (price–time priority, partial fills),
+- the **order book** structures (FIFO price levels, best bid/ask),
+- **exchange routing** (one book per symbol, cross-symbol lookup),
+- validation, errors, and structured event logging.
+
+Both new services import this package; **no engine logic is duplicated**.
+
+### New services
+
+| Service | Port | Location |
+|---------|------|----------|
+| **API Gateway** | `8000` | `services/api-gateway/` |
+| **Matching Service** | `8001` | `services/matching-service/` |
+
+### Architecture diagram
+
+```text
+Client
+  -> API Gateway            (FastAPI, :8000 — public routes, forwards over HTTP)
+      -> Matching Service   (FastAPI, :8001 — owns the exchange)
+          -> mini_exchange core library   (matching engine + order book)
+```
+
+The gateway talks to the matching service **only over HTTP** (via `httpx`);
+it never imports the engine. Decimal money fields are serialized as **strings**
+end to end, so precision is preserved across the network hop.
+
+### Service responsibilities
+
+| Component | Responsibilities |
+|-----------|------------------|
+| **API Gateway** | Public-facing API; forwards requests to the matching service; maps downstream/transport failures to clean HTTP errors (`400`/`404` passthrough, `503` upstream down, `504` timeout); simple `/health`. |
+| **Matching Service** | Order submission, cancellation, order book snapshots, resting-order lookup; owns a single in-process `Exchange`; `/health`. |
+| **Core Library (`mini_exchange`)** | Price–time priority, matching rules, partial fills, order book data structures, multi-symbol routing, validation. |
+
+### Run locally without Docker
+
+Install the core package once (this also provides FastAPI, Uvicorn, and HTTPX):
+
+```bash
+python -m pip install -e .
+```
+
+Start each service in its own terminal (run from inside the service directory so
+`app.main:app` resolves):
+
+```bash
+# Terminal 1 — Matching Service (:8001)
+cd services/matching-service
+uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+
+# Terminal 2 — API Gateway (:8000)
+cd services/api-gateway
+# point the gateway at the matching service (default is http://localhost:8001)
+# PowerShell:  $env:MATCHING_SERVICE_URL="http://localhost:8001"
+# bash:        export MATCHING_SERVICE_URL=http://localhost:8001
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Swagger UI: gateway at [http://localhost:8000/docs](http://localhost:8000/docs),
+matching service at [http://localhost:8001/docs](http://localhost:8001/docs).
+
+### Run with Docker Compose
+
+From the repository root:
+
+```bash
+docker compose up --build
+```
+
+This builds and starts both services on a shared network; the gateway is
+configured with `MATCHING_SERVICE_URL=http://matching-service:8001`. Stop with
+`docker compose down`.
+
+### Example requests
+
+```bash
+# Health — gateway
+curl http://localhost:8000/health
+
+# Health — matching service (direct)
+curl http://localhost:8001/health
+
+# Submit a resting buy order (through the gateway)
+curl -X POST http://localhost:8000/orders \
+  -H "Content-Type: application/json" \
+  -d '{"symbol":"BTC-USD","order_id":"b1","side":"buy","price":"100","quantity":"5"}'
+
+# Submit a crossing sell order — produces a trade
+curl -X POST http://localhost:8000/orders \
+  -H "Content-Type: application/json" \
+  -d '{"symbol":"BTC-USD","order_id":"s1","side":"sell","price":"100","quantity":"3"}'
+
+# Get the order book snapshot
+curl http://localhost:8000/orderbook/BTC-USD
+```
+
+### Why this architecture?
+
+Splitting the gateway from the matching service **separates public API routing
+from matching logic**, which keeps the **matching engine reusable** as a plain
+library (importable, testable, and embeddable without HTTP). It makes
+**service boundaries explicit** — the gateway owns edge concerns, the matching
+service owns book state — and it **prepares the project for growth**: a future
+market-data/streaming service, persistence (WAL + snapshots), authentication and
+rate limiting at the gateway, and metrics/tracing per service can each be added
+without disturbing the core engine.
+
+---
+
 ## Matching rules
 
 1. **Buys** consume the **lowest resting ask** first; **sells** consume the **highest resting bid** first.
@@ -81,7 +201,15 @@ mini-exchange/
 ├── README.md
 ├── benchmark.py
 ├── demo.py
+├── docker-compose.yml           # Gateway + Matching Service (local multi-service)
 ├── pyproject.toml
+├── services/                    # Microservices (thin HTTP layers over the core)
+│   ├── api-gateway/             # Public API, forwards to matching over HTTP (:8000)
+│   │   ├── app/                 # main.py, routes.py, client.py, config.py
+│   │   └── Dockerfile
+│   └── matching-service/        # Owns the Exchange; REST for orders/book (:8001)
+│       ├── app/                 # main.py, api.py, schemas.py, serializers.py, dependencies.py
+│       └── Dockerfile
 ├── src/
 │   ├── mini_exchange/           # Core engine
 │   │   ├── __init__.py
@@ -106,6 +234,8 @@ mini-exchange/
 │       └── ws_payloads.py
 └── tests/
     ├── fixtures.py
+    ├── test_api_gateway.py
+    ├── test_matching_service.py
     ├── test_api_smoke.py
     ├── test_cancel.py
     ├── test_cancel_lifecycle.py
