@@ -1,0 +1,33 @@
+# Version control
+.git
+.gitignore
+
+# Python caches / bytecode
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+**/*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Virtual environments
+.venv
+venv
+env
+
+# Build artifacts
+build
+dist
+*.egg
+wheels
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store
+
+# Docker
+docker-compose.yml
+.dockerignore
